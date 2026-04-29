@@ -2,6 +2,8 @@ import { makeGenericClientConstructor, ChannelCredentials, Metadata, status, cre
 import { GrpcReflection } from 'grpc-js-reflection-client';
 import * as protoLoader from '@grpc/proto-loader';
 import { generateGrpcSampleMessage } from './grpcMessageGenerator';
+import { TypeRegistry } from './typeRegistry';
+import { packAnyFieldsInValue, unpackAnyFieldsInValue } from './anyCodec';
 import * as tls from 'tls';
 import { isString } from 'lodash';
 import * as nodePath from 'node:path';
@@ -150,13 +152,15 @@ const getParsedGrpcUrlObject = (url) => {
  * @param {string} collectionUid - The collection UID
  * @param {Object} rpc - The gRPC object
  */
-const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onComplete) => {
+const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onComplete, responseTransform) => {
   let completed = false;
   const complete = () => {
     if (completed) return;
     completed = true;
     if (typeof onComplete === 'function') onComplete();
   };
+
+  const transform = typeof responseTransform === 'function' ? responseTransform : (res) => res;
 
   rpc.on('status', (status, res) => {
     const statusWithMetadata = {
@@ -182,7 +186,7 @@ const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onCompl
   });
 
   rpc.on('data', (res) => {
-    callback('grpc:response', requestId, collectionUid, { error: null, res });
+    callback('grpc:response', requestId, collectionUid, { error: null, res: transform(res) });
   });
 
   rpc.on('cancel', (res) => {
@@ -200,8 +204,21 @@ class GrpcClient {
   constructor(eventCallback) {
     this.activeConnections = new Map();
     this.methods = new Map();
+    this.typeRegistry = new TypeRegistry();
     this.eventCallback = eventCallback;
   }
+
+  /**
+   * Pre-process a parsed JSON message before serialization, packing any
+   * google.protobuf.Any values (identified by `@type`) into the wire form
+   * expected by @grpc/proto-loader's `requestSerialize`.
+   * @private
+   */
+  #applyAnyPacking(parsed) {
+    if (this.typeRegistry.size === 0) return parsed;
+    return packAnyFieldsInValue(parsed, this.typeRegistry);
+  }
+
 
   /**
    * Creates call options from metadata for gRPC calls
@@ -499,6 +516,7 @@ class GrpcClient {
    * Handle unary responses
    */
   #handleUnaryResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid }) {
+    const responseTransform = this.#buildResponseTransform(method);
     const rpc = client.makeUnaryRequest(
       requestPath,
       method.requestSerialize,
@@ -506,30 +524,34 @@ class GrpcClient {
       messages[0],
       metadata,
       (error, res) => {
-        this.eventCallback('grpc:response', requestId, collectionUid, { error, res });
+        const transformed = !error && responseTransform ? responseTransform(res) : res;
+        this.eventCallback('grpc:response', requestId, collectionUid, { error, res: transformed });
       }
     );
     this.#addConnection(requestId, { rpc, client });
 
-    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId), responseTransform);
   }
 
   #handleClientStreamingResponse({ client, requestId, requestPath, method, metadata, collectionUid }) {
+    const responseTransform = this.#buildResponseTransform(method);
     const rpc = client.makeClientStreamRequest(
       requestPath,
       method.requestSerialize,
       method.responseDeserialize,
       metadata,
       (error, res) => {
-        this.eventCallback('grpc:response', requestId, collectionUid, { error, res });
+        const transformed = !error && responseTransform ? responseTransform(res) : res;
+        this.eventCallback('grpc:response', requestId, collectionUid, { error, res: transformed });
       }
     );
     this.#addConnection(requestId, { rpc, client });
 
-    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId), responseTransform);
   }
 
   #handleServerStreamingResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid }) {
+    const responseTransform = this.#buildResponseTransform(method);
     const message = messages[0];
     const rpc = client.makeServerStreamRequest(
       requestPath,
@@ -538,15 +560,17 @@ class GrpcClient {
       message,
       metadata,
       (error, res) => {
-        this.eventCallback('grpc:response', requestId, collectionUid, { error, res });
+        const transformed = !error && responseTransform ? responseTransform(res) : res;
+        this.eventCallback('grpc:response', requestId, collectionUid, { error, res: transformed });
       }
     );
     this.#addConnection(requestId, { rpc, client });
 
-    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId), responseTransform);
   }
 
   #handleBidiStreamingResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid }) {
+    const responseTransform = this.#buildResponseTransform(method);
     const rpc = client.makeBidiStreamRequest(
       requestPath,
       method.requestSerialize,
@@ -555,7 +579,7 @@ class GrpcClient {
     );
     this.#addConnection(requestId, { rpc, client });
 
-    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+    setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId), responseTransform);
   }
 
   /**
@@ -668,7 +692,10 @@ class GrpcClient {
 
     let messages = request.body.grpc;
     try {
-      messages = messages.map(({ content }) => safeJsonParse(content, 'message content'));
+      messages = messages.map(({ content }) => {
+        const parsed = safeJsonParse(content, 'message content');
+        return this.#applyAnyPacking(parsed);
+      });
     } catch (parseError) {
       console.error('Failed to parse gRPC message content:', parseError);
       client.close();
@@ -698,6 +725,28 @@ class GrpcClient {
   }
 
   /**
+   * Build a transform function that unpacks google.protobuf.Any fields in
+   * a deserialized response. Returns null when no descriptor info is available
+   * or no types are registered, in which case the raw response is forwarded.
+   * @private
+   */
+  #buildResponseTransform(method) {
+    const fields = method?.responseType?.type?.field;
+    if (!Array.isArray(fields) || fields.length === 0 || this.typeRegistry.size === 0) {
+      return null;
+    }
+    return (res) => {
+      if (!res || typeof res !== 'object') return res;
+      try {
+        return unpackAnyFieldsInValue(res, fields, this.typeRegistry);
+      } catch (e) {
+        console.warn('Failed to unpack google.protobuf.Any in response:', e);
+        return res;
+      }
+    };
+  }
+
+  /**
    * Send a message to an active gRPC connection
    * @param {string} requestId - The request ID of the active connection
    * @param {string} collectionUid - The collection UID for the request
@@ -724,6 +773,14 @@ class GrpcClient {
         }
       } else {
         parsedBody = body;
+      }
+
+      try {
+        parsedBody = this.#applyAnyPacking(parsedBody);
+      } catch (packError) {
+        console.error('Failed to pack google.protobuf.Any in message body:', packError);
+        this.eventCallback('grpc:error', requestId, collectionUid, { error: packError });
+        return;
       }
 
       rpc.write(parsedBody, (error) => {
@@ -806,6 +863,13 @@ class GrpcClient {
       });
       methodsWithType.forEach((method) => {
         this.methods.set(method.path, method);
+        // grpc-js-reflection-client uses protobufjs internally; if request/response
+        // types expose a protobufjs Root, register every type reachable from it
+        // so google.protobuf.Any values can be resolved by `@type` URL.
+        const reqRoot = method.requestType?.root || method.requestType?.parent?.root;
+        const resRoot = method.responseType?.root || method.responseType?.parent?.root;
+        if (reqRoot) this.typeRegistry.registerNamespace(reqRoot);
+        if (resRoot) this.typeRegistry.registerNamespace(resRoot);
       });
       return methodsWithType;
     } catch (error) {
@@ -829,6 +893,15 @@ class GrpcClient {
     methods.forEach((method) => {
       this.methods.set(method.path, method);
     });
+
+    // Populate the type registry so google.protobuf.Any values referencing
+    // any message defined in this proto tree can be packed/unpacked at runtime.
+    try {
+      await this.typeRegistry.loadFromProtoFile(filePath, includeDirs);
+    } catch (e) {
+      console.warn('Failed to populate Any type registry from proto file:', e);
+    }
+
     return methodsWithType;
   }
 
