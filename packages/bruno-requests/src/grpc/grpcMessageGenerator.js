@@ -1,32 +1,116 @@
 import { faker } from '@faker-js/faker';
 
+const PROTOBUFJS_TO_DESCRIPTOR_TYPE = {
+  double: 'TYPE_DOUBLE',
+  float: 'TYPE_FLOAT',
+  int32: 'TYPE_INT32',
+  int64: 'TYPE_INT64',
+  uint32: 'TYPE_UINT32',
+  uint64: 'TYPE_UINT64',
+  sint32: 'TYPE_SINT32',
+  sint64: 'TYPE_SINT64',
+  fixed32: 'TYPE_FIXED32',
+  fixed64: 'TYPE_FIXED64',
+  sfixed32: 'TYPE_SFIXED32',
+  sfixed64: 'TYPE_SFIXED64',
+  bool: 'TYPE_BOOL',
+  string: 'TYPE_STRING',
+  bytes: 'TYPE_BYTES'
+};
+
+const ensureLeadingDot = (name) => (name && !name.startsWith('.') ? `.${name}` : name);
+
+/**
+ * Convert a protobufjs Field into the descriptor-proto-like shape used by the
+ * sample generator (matches @grpc/proto-loader's output for top-level fields).
+ */
+const protobufFieldToDescriptor = (pbField) => {
+  const descriptor = {
+    name: pbField.name,
+    label: pbField.repeated ? 'LABEL_REPEATED' : 'LABEL_OPTIONAL'
+  };
+
+  const primitiveType = PROTOBUFJS_TO_DESCRIPTOR_TYPE[pbField.type];
+  if (primitiveType) {
+    descriptor.type = primitiveType;
+    return descriptor;
+  }
+
+  if (pbField.resolvedType) {
+    descriptor.typeName = ensureLeadingDot(pbField.resolvedType.fullName);
+    descriptor.type = pbField.resolvedType.values !== undefined ? 'TYPE_ENUM' : 'TYPE_MESSAGE';
+    return descriptor;
+  }
+
+  descriptor.type = 'TYPE_STRING';
+  return descriptor;
+};
+
+/**
+ * Resolve a field's nested fields (descriptor-proto shape) using either the
+ * field's already-populated `messageType.field` or the typeRegistry lookup
+ * via `typeName`.
+ */
+const resolveNestedFields = (field, typeRegistry) => {
+  if (field.messageType && Array.isArray(field.messageType.field)) {
+    return { fields: field.messageType.field, typeKey: field.typeName || '' };
+  }
+  if (typeRegistry && field.typeName) {
+    const lookup = typeof typeRegistry.resolveType === 'function'
+      ? typeRegistry.resolveType.bind(typeRegistry)
+      : typeRegistry.lookupType.bind(typeRegistry);
+    const pbType = lookup(field.typeName);
+    if (pbType && Array.isArray(pbType.fieldsArray)) {
+      return {
+        fields: pbType.fieldsArray.map(protobufFieldToDescriptor),
+        // Use the resolved protobufjs full name as the cycle key so that
+        // unqualified `typeName`s (e.g. "Tree") and qualified ones
+        // (e.g. ".brunotest.nested.Tree") collapse to the same identity.
+        typeKey: ensureLeadingDot(pbType.fullName)
+      };
+    }
+  }
+  return null;
+};
+
 /**
  * Generates a sample message based on method parameter fields
  * @param {Object} fields - Method parameter fields
  * @param {Object} options - Generation options
+ * @param {Set<string>} seenTypes - Types currently in the recursion path (cycle guard)
  * @returns {Object} Generated message
  */
-const generateSampleMessageFromFields = (fields, options = {}) => {
+const generateSampleMessageFromFields = (fields, options = {}, seenTypes = new Set()) => {
   const result = {};
 
   if (!fields || !Array.isArray(fields)) {
     return {};
   }
 
+  const { typeRegistry } = options;
+
   fields.forEach((field) => {
     // Generate a value based on field name and type
     if (field.type === 'TYPE_MESSAGE') {
-      // Handle nested message
-      if (field.messageType && field.messageType.field) {
+      const resolved = resolveNestedFields(field, typeRegistry);
+
+      if (resolved) {
+        const { fields: nestedFields, typeKey } = resolved;
+        if (typeKey && seenTypes.has(typeKey)) {
+          // Avoid infinite recursion on self-referential / cyclic message types
+          result[field.name] = field.label === 'LABEL_REPEATED' ? [{}] : {};
+          return;
+        }
+        const nextSeen = typeKey ? new Set([...seenTypes, typeKey]) : seenTypes;
         if (field.label === 'LABEL_REPEATED') {
           // Generate array of nested messages
           const count = options.arraySize || faker.number.int({ min: 1, max: 3 });
           result[field.name] = Array.from({ length: count }, () =>
-            generateSampleMessageFromFields(field.messageType.field, options)
+            generateSampleMessageFromFields(nestedFields, options, nextSeen)
           );
         } else {
           // Generate single nested message
-          result[field.name] = generateSampleMessageFromFields(field.messageType.field, options);
+          result[field.name] = generateSampleMessageFromFields(nestedFields, options, nextSeen);
         }
       } else {
         // No field info for nested message, generate a simple object

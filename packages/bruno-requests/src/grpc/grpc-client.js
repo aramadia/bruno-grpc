@@ -990,8 +990,13 @@ class GrpcClient {
         method = this.methods.get(methodPath);
       }
 
-      // Generate a sample message using our generator
-      const sampleMessage = generateGrpcSampleMessage(method, options);
+      // Generate a sample message using our generator. Pass the type registry
+      // so nested message fields can be resolved via their `typeName` reference
+      // when the descriptor doesn't include `messageType.field` inline.
+      const sampleMessage = generateGrpcSampleMessage(method, {
+        ...options,
+        typeRegistry: options.typeRegistry || this.typeRegistry
+      });
 
       return {
         success: true,
