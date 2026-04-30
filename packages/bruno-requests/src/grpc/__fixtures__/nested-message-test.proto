@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package brunotest.nested;
+
+message Address {
+  string street = 1;
+  string city = 2;
+  string zip = 3;
+}
+
+message Contact {
+  string email = 1;
+  string phone = 2;
+}
+
+message Person {
+  string name = 1;
+  int32 age = 2;
+  Address address = 3;
+  repeated Contact contacts = 4;
+}
+
+message Tree {
+  string label = 1;
+  repeated Tree children = 2;
+}
+
+service PeopleService {
+  rpc Create (Person) returns (Person);
+  rpc CreateTree (Tree) returns (Tree);
+}

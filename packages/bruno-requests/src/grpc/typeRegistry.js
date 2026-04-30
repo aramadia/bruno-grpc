@@ -76,6 +76,26 @@ class TypeRegistry {
   }
 
   /**
+   * Resolve a type by name, accepting fully-qualified, partially-qualified,
+   * or simple names. Falls back to a suffix match against registered full
+   * names so unqualified descriptor `typeName` values (e.g. "Address" emitted
+   * by @grpc/proto-loader for same-package references) can still be resolved.
+   * @param {string} name
+   * @returns {protobuf.Type|null}
+   */
+  resolveType(name) {
+    if (!name) return null;
+    const stripped = stripLeadingDot(name);
+    const direct = this.types.get(stripped);
+    if (direct) return direct;
+    const suffix = `.${stripped}`;
+    for (const [fullName, type] of this.types) {
+      if (fullName.endsWith(suffix)) return type;
+    }
+    return null;
+  }
+
+  /**
    * @param {string} typeUrl e.g. "type.googleapis.com/package.Message"
    * @returns {protobuf.Type|null}
    */
